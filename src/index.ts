@@ -17,8 +17,8 @@ app.get('/health', (_, res) => {
   res.status(204).send()
 })
 
-app.get('/hello', (req, res) => {
-  res.status(200).send(`Hello World, this is WalletConnect v${pkg.version}`)
+app.get('/status', (req, res) => {
+  res.status(200).send(`Web3Connect v${pkg.version}`)
 })
 
 app.get('/info', (req, res) => {

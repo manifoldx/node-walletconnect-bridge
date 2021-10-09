@@ -2,6 +2,7 @@
 project=${1}
 secretName="${project}_cloudflare"
 
+
 cloudflare=$(grep CLOUDFLARE config | cut -f2 -d=)
 case $cloudflare in
   false | "N" | "NO" | "No" | "no" | "n" )
@@ -12,6 +13,7 @@ case $cloudflare in
     ;;
 esac
 
+
 if [[ $cloudflare == false ]];then
   sed -i 's/^CLOUDFLARE=.$/CLOUDFLARE=false/g' config
 else
@@ -19,6 +21,7 @@ else
   read -p "Please paste your cloudflare dns api token: " token
   docker secret rm $secretName
   printf $token | docker secret create $secretName -
+
 
   cat - > /tmp/${project}.secrets.yml<<EOF
 version: '3.7'
@@ -34,5 +37,3 @@ services:
       - ${secretName}
 EOF
 fi
-
-
