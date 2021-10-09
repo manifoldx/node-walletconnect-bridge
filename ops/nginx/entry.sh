@@ -1,27 +1,30 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
 
 # Set default variables
 root_domain="${DOMAIN_URL:-localhost}"
+app_env="${APP:-development}"
 manage_root_domain=${MANAGE_ROOT_DOMAIN:-true}
 email="${EMAIL:-noreply@gmail.com}"
 docker_containers="${SUBDOMAINS}"
 app_container_dns_name="${CONTAINER_NAME}"
-app_env="${APP_ENV:-development}"
-app_port="${APP_PORT:-5001}"
+app_port="${APP_PORT:-5555}"
 app_qty="${APP_QTY:-5}"
+
 
 LETSENCRYPT=/etc/letsencrypt/live
 SERVERS=/etc/nginx/servers
+
 
 echo "
 USING ENVVARS:
 root_domain=$root_domain
 docker containers to proxy pass to (docker_containers)=$docker_containers
 cert email=$email
-app_env=$app_env
 app_port=$app_port
 app_qty=$app_qty
 "
+
 
 function makeCert () {
   fullDomain=$1
@@ -31,6 +34,7 @@ function makeCert () {
     echo "Developing locally, generating self-signed certs"
     openssl req -x509 -newkey rsa:4096 -keyout $certDirectory/privkey.pem -out $certDirectory/fullchain.pem -days 365 -nodes -subj '/CN=localhost'
   fi
+
 
   if [[ ! -f "$certDirectory/privkey.pem" ]]
   then
@@ -43,6 +47,7 @@ function makeCert () {
       certbot certonly --dns-cloudflare --dns-cloudflare-credentials /run/secrets/cloudflare.ini -d $fullDomain -m $email --agree-tos --no-eff-email -n
     fi
 
+
     if [[ ! $? -eq 0 ]] 
     then
       echo "ERROR"
@@ -51,6 +56,7 @@ function makeCert () {
     fi
   fi
 }
+
 
 function waitForContainerToBeUp () {
   count=0
@@ -67,6 +73,7 @@ function waitForContainerToBeUp () {
   done
 }
 
+
 function configSubDomain () {
   subDomain=$1
   dockerPort=$2
@@ -78,8 +85,8 @@ function configSubDomain () {
   makeCert "$fullDomain" $certDirectory
   cat - > "$SERVERS/$fullDomain.conf" <<EOF
 server {
-  listen  80;
-  listen [::]:80;
+  listen  8080;
+  listen [::]:8080;
   server_name $fullDomain;
   include /etc/nginx/letsencrypt.conf;
   location / {
@@ -87,29 +94,30 @@ server {
   }
 }
 server {
-  listen  443 ssl;
-  listen [::]:443 ssl;
+  listen  8443 ssl;
+  listen [::]:8443 ssl;
   ssl_certificate       $certDirectory/fullchain.pem;
   ssl_certificate_key   $certDirectory/privkey.pem;
   server_name $fullDomain;
   location / {
-		proxy_pass "http://$subDomain:$dockerPort";
+    proxy_pass "http://$subDomain:$dockerPort";
   }
 }
 EOF
 }
 
+
 function configLoadBalancingForApp () {
   configPath="${1:-$SERVERS/$1}"
   appQty=${2:-1}
-  port=${3:-5001}
+  port=${3:-5555}
   dockerContainerName=$4
   if [[ ! $dockerContainerName ]]; then
     printf "Need to give the docker name of the main app. Quitting...\n"
     exit 1
   fi
   cat - >> $configPath<<EOF
-upstream app {
+upstream upstream_app {
 # request_uri is used in this situation because
 # it is compatible with both the random uuid that the stress
 # does and the production server uri of "" (no uri).
@@ -119,7 +127,7 @@ upstream app {
 EOF
   for i in $(seq 0 $((appQty - 1))); do
     if [[ $i == 0 ]]; then
-      echo "server $dockerContainerName$i:$port max_fails=1 fail_timeout=5s;" >> $configPath
+      echo "server $dockerContainerName$i:$port max_fails=1 fail_timeout=10s;" >> $configPath
     else
       echo "server $dockerContainerName$i:$port backup;" >> $configPath
     fi
@@ -127,17 +135,31 @@ EOF
   echo "}" >> $configPath
 }
 
+
 function configRootDomain () {
   domain=$1
   printf "\nConfiguring root domain: $domain\n"
   certDirectory=$LETSENCRYPT/$domain
   mkdir -vp $certDirectory
   makeCert $domain $certDirectory
+
+
+  ddosMitigation=$(printf '
+    limit_req_zone $remote_addr zone=req_zone_one:100m rate=1000r/m;
+    limit_req zone=req_zone_one;
+    limit_except GET POST { deny all; }
+    ')
+  # Only add the DDoS protection in production mode
+  if [[ $app_env == "development" ]]; then
+    ddosMitigation=""
+  fi 
   configPath="$SERVERS/$domain.conf"
+
+
   cat - > $configPath <<EOF
 server {
-  listen 80;
-  listen [::]:80;
+  listen 8080;
+  listen [::]:8080;
   server_name $domain;
   include /etc/nginx/letsencrypt.conf;
   location / {
@@ -145,24 +167,23 @@ server {
   }
 }
 server {
-  listen 443 ssl;
-  listen [::]:443 ssl;
+  listen 8443 ssl;
+  listen [::]:8443 ssl;
   server_name $domain;
+  # https://stackoverflow.com/questions/35744650/docker-network-nginx-resolver
+  resolver 127.0.0.11 valid=5s ipv6=off;
  
   ssl_certificate           $certDirectory/fullchain.pem;
   ssl_certificate_key       $certDirectory/privkey.pem;
 
   location / {
-    # https://stackoverflow.com/questions/35744650/docker-network-nginx-resolver
-    resolver 127.0.0.11 valid=30s;
+    $ddosMitigation
     proxy_read_timeout      1800;
     proxy_send_timeout      1800;
     keepalive_timeout       1800;
-    add_header "Access-Control-Allow-Origin"  *;
     proxy_set_header        Host \$host;
     proxy_set_header        http_x_forwarded_for  \$remote_addr;
-    proxy_pass              http://app;
-
+    proxy_pass              http://upstream_app;
 
     # Websocket must have configs
     proxy_http_version      1.1;
@@ -173,6 +194,7 @@ server {
 }
 EOF
 }
+
 
 # periodically fork off & see if our certs need to be renewed
 function renewcerts {
@@ -186,11 +208,14 @@ function renewcerts {
   done
 }
 
+
 function main () {
+
 
   mkdir -vp $LETSENCRYPT
   mkdir -vp $SERVERS
   mkdir -vp /var/www/letsencrypt
+
 
   for container_port in $docker_containers; do
     port=$(echo $container_port | cut -d':' -f 2)
@@ -198,6 +223,7 @@ function main () {
     waitForContainerToBeUp $container
     configSubDomain $container $port $root_domain 
   done
+
 
   if [[ $manage_root_domain ]]; then
     configRootDomain $root_domain
@@ -208,16 +234,20 @@ function main () {
       $app_container_dns_name
   fi
 
+
   if [[ "$fullDomain" != "localhost" ]]
   then
     echo "Forking renewcerts to the background for $fullDomain..."
     renewcerts $fullDomain &
   fi
 
+
   sleep 4 # give renewcerts a sec to do it's first check
+
 
   echo "Entrypoint finished, executing nginx..."; echo
   exec nginx
 }
+
 
 main
